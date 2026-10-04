@@ -43,6 +43,10 @@
   paper_withdrawals 表每篇撤回稿至多一行, 保存非空撤回原因、推进后的资料修订号、
   撤回时间及撤回瞬间的发布序号与槽位 (供追溯); 匹配当前修订号的同原因重试幂等
   返回原记录 (不推进修订号), 异原因/版本不符拒绝且无部分改动。
+- paper_review_levels 表保存会务方按论文设置的评审保障等级
+  (high=高 / medium=中, 普通等级缺省不落行): 相同等级重试幂等, 有效变更
+  推进资料修订号 +1; 等级仅在完整方案不可得时决定部分分配的择稿优先级
+  (先完整总数、再高/中等级完整数、最后全局字典序), 论文删除/撤回时级联清除。
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -247,6 +251,16 @@ CREATE TABLE IF NOT EXISTS paper_withdrawals (
     published_plan_json TEXT,                -- 撤回瞬间该稿的槽位 JSON: [评审人编号 ...]
     withdrawn_at        TEXT NOT NULL
 );
+-- 论文评审保障等级 (会务方按论文设置: high=高 / medium=中; 普通不落行, 缺省即普通)。
+-- 仅在完整方案不可得时影响部分分配的择稿优先级 (先完整总数, 再高、中等级完整数,
+-- 最后沿用全局字典序); 完整可行时仍按既有容量比例 + 字典序优化, 等级不改变硬约束。
+-- 相同等级重试幂等 (不推进修订号); 有效变更推进资料修订号 +1。
+-- 论文删除或撤回时其等级行随论文级联清除 (等级不再参与求解)。
+CREATE TABLE IF NOT EXISTS paper_review_levels (
+    paper_id   TEXT PRIMARY KEY,
+    level      TEXT NOT NULL CHECK (level IN ('high', 'medium')),
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -369,6 +383,19 @@ def load_assignment_locks(conn: sqlite3.Connection):
         r["paper_id"]: json.loads(r["reviewers_json"])
         for r in conn.execute(
             "SELECT paper_id, reviewers_json FROM assignment_locks ORDER BY paper_id"
+        ).fetchall()
+    }
+
+
+def load_paper_review_levels(conn: sqlite3.Connection):
+    """读取论文评审保障等级, 返回 {paper_id: 'high'|'medium'}。
+
+    普通等级不落行 (缺省即普通); 论文删除/撤回时其行已级联清除。
+    """
+    return {
+        r["paper_id"]: r["level"]
+        for r in conn.execute(
+            "SELECT paper_id, level FROM paper_review_levels ORDER BY paper_id"
         ).fetchall()
     }
 
