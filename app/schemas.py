@@ -25,6 +25,17 @@ class PaperWithdrawalIn(BaseModel):
     reason: str = Field(min_length=1, max_length=1000, description="非空撤回原因 (首尾空白归一化后仍须非空)")
 
 
+class PaperGuaranteeLevelIn(BaseModel):
+    """按论文设置评审保障等级 (high/medium/normal; 未设置即普通, 设置为 normal 即恢复默认)。"""
+
+    paper_id: str = Field(min_length=1, max_length=128, description="要设置保障等级的现存论文编号")
+    level: str = Field(
+        min_length=1, max_length=16,
+        description="评审保障等级: high=高, medium=中, normal=普通 (其余值非法)",
+    )
+    base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
+
+
 class ReviewerIn(BaseModel):
     reviewer_id: str = Field(min_length=1, max_length=128)
     credential: str = Field(min_length=1, max_length=256)

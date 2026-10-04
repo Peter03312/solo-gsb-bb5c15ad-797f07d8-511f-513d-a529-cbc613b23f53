@@ -23,6 +23,7 @@ def clean_db():
         conn.execute("DELETE FROM reviewers")
         conn.execute("DELETE FROM published")
         conn.execute("DELETE FROM assignment_locks")
+        conn.execute("DELETE FROM paper_guarantee_levels")
         conn.execute("UPDATE meta SET value = '0' WHERE key = 'revision'")
     yield
 

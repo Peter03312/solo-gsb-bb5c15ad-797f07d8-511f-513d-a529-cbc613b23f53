@@ -18,6 +18,14 @@
   1. 最小化全体评审人中最高的"已用容量比例"(已分配数 / 容量);
   2. 在此前提下, 按 (论文编号升序, 每篇的评审人编号对升序) 展开的全局序列
      取字典序最小的方案。
+
+评审保障等级 (levels: {论文编号: high/medium/normal}, 未设置视为普通):
+  仅在无法完整覆盖全部目标论文时参与求解——部分方案的选取次序为
+  1. 完整分配的论文总数最大;
+  2. 在此前提下, 高等级 (high) 完整分配数最大;
+  3. 再使中等级 (medium) 完整分配数最大;
+  4. 最后沿用既有全局字典序择优。
+  完整可行时等级不影响求解, 仍按上述容量比例与字典序优化。
 """
 from __future__ import annotations
 
@@ -185,17 +193,20 @@ class Solver:
 
     # ---------- 不可行时的部分方案与诊断 ----------
 
-    def max_partial(self, caps):
-        """求最多论文被完整分配的部分方案 (并列时按全局序列字典序最小)。
+    def max_partial(self, caps, levels=None):
+        """求最多论文被完整分配的部分方案。
 
-        返回 (assignment, loads)。
+        选取次序: 完整分配总数最大 -> 高等级完整分配数最大 -> 中等级完整
+        分配数最大 -> 全局序列字典序最小 (levels 缺省时全部视为普通,
+        退化为原有的"总数 + 字典序")。返回 (assignment, loads)。
         """
+        levels = levels or {}
         order = [p.paper_id for p in self.papers]
         n = len(order)
         pairs_of = {pid: self.info[pid]["pairs"] for pid in order}
         loads = {rid: 0 for rid in caps}
         assignment = {}
-        best = {"count": -1, "key": None, "assignment": None, "loads": None}
+        best = {"rank": None, "key": None, "assignment": None, "loads": None}
 
         def key_of(assign):
             seq = []
@@ -207,13 +218,24 @@ class Solver:
                     seq.append((1, "", ""))
             return tuple(seq)
 
+        def rank_of(assign, count):
+            # (总数, 高等级数, 中等级数): 越大越优; 等级未知一律按普通计
+            high = sum(1 for pid in assign if levels.get(pid) == "high")
+            medium = sum(1 for pid in assign if levels.get(pid) == "medium")
+            return (count, high, medium)
+
         def backtrack(i, count):
-            if best["count"] > count + (n - i):
+            if best["rank"] is not None and best["rank"][0] > count + (n - i):
                 return  # 已不可能取得更多分配
             if i == n:
+                rank = rank_of(assignment, count)
                 k = key_of(assignment)
-                if count > best["count"] or (count == best["count"] and (best["key"] is None or k < best["key"])):
-                    best["count"] = count
+                if (
+                    best["rank"] is None
+                    or rank > best["rank"]
+                    or (rank == best["rank"] and k < best["key"])
+                ):
+                    best["rank"] = rank
                     best["key"] = k
                     best["assignment"] = dict(assignment)
                     best["loads"] = dict(loads)
@@ -277,13 +299,35 @@ def _loads_of(plan):
     return loads
 
 
-def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
+def _level_summary(paper_ids, assigned_ids, levels):
+    """按评审保障等级统计已分配/未分配论文数 (未设置等级视为普通 normal)。
+
+    paper_ids: 本次求解的目标论文 (已按编号排序); assigned_ids: 其中被完整
+    分配的论文集合。等级未知的值一律按普通计, 保证响应键固定为
+    high/medium/normal 三档。
+    """
+    levels = levels or {}
+    assigned = set(assigned_ids)
+    summary = {lv: {"assigned": 0, "unassigned": 0} for lv in ("high", "medium", "normal")}
+    for pid in paper_ids:
+        lv = levels.get(pid, "normal")
+        if lv not in summary:
+            lv = "normal"
+        summary[lv]["assigned" if pid in assigned else "unassigned"] += 1
+    return summary
+
+
+def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None, levels=None):
     """求解入口。返回可 JSON 序列化的结果字典。
 
     inst_group: 机构归并组 {原名: 组键}; 机构冲突一律按归并组判定。
+    levels:     评审保障等级 {论文编号: high/medium/normal}; 仅在无法完整
+                覆盖全部论文时参与求解 (先总数, 再依次高/中等级数, 最后字典序),
+                完整可行时不影响容量比例与字典序优化。
     """
     solver = Solver(papers, reviewers, recused_pairs, inst_group)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
+    paper_ids = [p.paper_id for p in solver.papers]
     explanations = {
         pid: {
             "eligible_reviewers": [r.reviewer_id for r in info["eligible"]],
@@ -314,11 +358,13 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
             "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
             "papers": paper_entries(plan),
             "diagnostics": {},
+            "level_summary": _level_summary(paper_ids, plan.keys(), levels),
         }
 
-    # 无完整方案: 给出最大部分方案与每篇未分配论文的限制原因, 发布版不受影响
+    # 无完整方案: 给出最大部分方案 (先总数, 再依次高/中等级完整分配数,
+    # 最后全局字典序) 与每篇未分配论文的限制原因, 发布版不受影响
     full_caps = {r.reviewer_id: r.capacity for r in solver.reviewers}
-    partial, loads = solver.max_partial(full_caps)
+    partial, loads = solver.max_partial(full_caps, levels)
     unassigned = [p.paper_id for p in solver.papers if p.paper_id not in partial]
     return {
         "feasible": False,
@@ -329,6 +375,7 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
         "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
         "papers": paper_entries(partial),
         "diagnostics": solver.diagnose(unassigned, loads, full_caps),
+        "level_summary": _level_summary(paper_ids, partial.keys(), levels),
     }
 
 
@@ -341,7 +388,7 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
 #           (lock_* 诊断), 发布因此拒绝。
 
 def _compute_fixed_assignment(
-    papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, *, strict=False
+    papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, levels=None, *, strict=False
 ):
     """固定槽位求解。
 
@@ -350,15 +397,21 @@ def _compute_fixed_assignment(
                  与作者同机构 (含归并), 或被锁两人同机构/均不擅长/累计超容量,
                  该论文不可完整分配, 锁定槽位不予释放;
     strict=False 时为补位: 失效固定位置按既有规则释放并标注 fixed_* 原因。
+    levels: 评审保障等级 {论文编号: high/medium/normal}; 仅在无法完整覆盖
+            目标论文时参与部分方案选取 (先总数, 再依次高/中等级数, 最后字典序);
+            完整可行时不影响容量比例与字典序优化; 失效锁定 (strict) 的论文
+            始终不可完整分配, 等级再高也不释放其锁定。
 
     其余位置一律遵守原有全部硬约束与优化次序 (先最小化最高容量比例、
     再全局字典序最小); 单人固定时仅枚举"包含该固定评审人"的合法对,
     故专长要求可由另一人满足。
     """
     recused_pairs = set(recused_pairs)
+    levels = levels or {}
     solver = Solver(papers, reviewers, recused_pairs, inst_group)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     paper_by_id = {p.paper_id: p for p in solver.papers}
+    paper_ids = [p.paper_id for p in solver.papers]
 
     label = "lock" if strict else "fixed"
     slot_key = "locks" if strict else "fixed"
@@ -586,11 +639,14 @@ def _compute_fixed_assignment(
                 problems_key: problems,
                 "papers": _fixed_paper_entries(solver, plan, fixed, problems, slot_key, problems_key),
                 "diagnostics": {},
+                "level_summary": _level_summary(paper_ids, plan.keys(), levels),
             }
 
     # ---- 无完整方案: 最大部分方案 + 诊断 ----
+    # 部分方案选取次序: 完整分配总数最大 -> 高等级数最大 -> 中等级数最大 ->
+    # 全局字典序最小; 失效锁定 (strict) 的论文不参与求解, 等级再高也不释放
     cur = dict(loads)
-    best = {"count": -1, "key": None, "chosen": None}
+    best = {"rank": None, "key": None, "chosen": None}
     n = len(free_pids)
     chosen_partial = {}
 
@@ -603,15 +659,24 @@ def _compute_fixed_assignment(
                 seq.append((1, "", ""))
         return tuple(seq)
 
+    def rank_of(chosen, count):
+        # 固定对在所有候选中恒定分配, 不影响比较, 只需统计自由论文的等级
+        high = sum(1 for pid in chosen if levels.get(pid) == "high")
+        medium = sum(1 for pid in chosen if levels.get(pid) == "medium")
+        return (count, high, medium)
+
     def backtrack_partial(i, count):
-        if best["count"] > count + (n - i):
+        if best["rank"] is not None and best["rank"][0] > count + (n - i):
             return
         if i == n:
+            rank = rank_of(chosen_partial, count)
             k = key_of(chosen_partial)
-            if count > best["count"] or (
-                count == best["count"] and (best["key"] is None or k < best["key"])
+            if (
+                best["rank"] is None
+                or rank > best["rank"]
+                or (rank == best["rank"] and k < best["key"])
             ):
-                best["count"] = count
+                best["rank"] = rank
                 best["key"] = k
                 best["chosen"] = dict(chosen_partial)
             return
@@ -660,10 +725,11 @@ def _compute_fixed_assignment(
             solver, unassigned, final_loads, full_caps, pairs_of, fixed, problems,
             requested, infeasible, slot_key, problems_key, label,
         ),
+        "level_summary": _level_summary(paper_ids, partial_plan.keys(), levels),
     }
 
 
-def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=None):
+def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, levels=None):
     """补位预演: 仅面向当前发布版内的论文 (papers 已按该范围过滤)。
 
     fixed_map:     {paper_id: [reviewer_id, ...]} 当前发布版中"已确认且未回避"
@@ -671,6 +737,9 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
     recused_pairs: {(reviewer_id, paper_id)} 评审人通过决定接口声明的硬回避
                    (与会务方录入的 avoid_papers 等价, 但诊断原因单独标注)。
     inst_group:    机构归并组 {原名: 组键}; 机构冲突一律按归并组判定。
+    levels:        评审保障等级 {论文编号: high/medium/normal}; 仅在无法完整
+                   覆盖目标论文时参与部分方案选取 (先总数, 再依次高/中等级数,
+                   最后字典序), 完整可行时不影响既有优化次序。
 
     数据变更导致固定关系失效时 (评审人被删除/与作者变为同机构/硬回避等),
     该固定位置释放为可补位置, 并在 papers[pid].fixed_problems 中说明。
@@ -680,24 +749,27 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
     注意: 补位不读取普通分配锁定表——锁定仅约束普通分配, 不改变补位规则。
     """
     return _compute_fixed_assignment(
-        papers, reviewers, fixed_map, recused_pairs, inst_group, strict=False
+        papers, reviewers, fixed_map, recused_pairs, inst_group, levels, strict=False
     )
 
 
-def compute_locked_assignment(papers, reviewers, lock_map, recused_pairs=(), inst_group=None):
+def compute_locked_assignment(papers, reviewers, lock_map, recused_pairs=(), inst_group=None, levels=None):
     """带锁定槽位的普通分配。
 
     lock_map: {paper_id: [reviewer_id, ...]} 会务方在普通分配前提交的锁定表
               (每篇 0~2 名评审人; 空表/缺省 = 不锁定)。
+    levels:   评审保障等级 {论文编号: high/medium/normal}; 仅在无法完整覆盖
+              全部论文时参与部分方案选取 (先总数, 再依次高/中等级数, 最后字典序)。
 
     锁定槽位必须保留: 其余位置在机构冲突、主题专长、回避、资格、容量等全部
     既有硬约束与既有优化次序下重算; 单人锁定时专长可由另一人满足。
     锁定人随后被删除、停用、回避或因资料/机构归并而失格, 或锁定累计超容量时,
     锁定槽位绝不悄悄释放: 对应论文在 lock_problems/诊断中给出具体原因并标记为
-    不可完整分配 (feasible=false), 发布据此拒绝且不改变当前发布版。
+    不可完整分配 (feasible=false), 发布据此拒绝且不改变当前发布版;
+    保障等级再高也不释放失效锁定。
     """
     return _compute_fixed_assignment(
-        papers, reviewers, lock_map, recused_pairs, inst_group, strict=True
+        papers, reviewers, lock_map, recused_pairs, inst_group, levels, strict=True
     )
 
 

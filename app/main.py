@@ -25,6 +25,7 @@ from .schemas import (
     FeedbackObjectionIn,
     InstitutionMergeIn,
     LockTableIn,
+    PaperGuaranteeLevelIn,
     PaperIn,
     PaperUpdate,
     PaperWithdrawalIn,
@@ -284,6 +285,7 @@ def _build_backfill(conn, published_row):
         fixed,
         recused_pairs=_recused_pairs(conn),
         inst_group=_institution_groups(conn),
+        levels=db.load_guarantee_levels(conn),
     )
     result["serial"] = serial
     result["published_revision"] = published_row["revision"]
@@ -294,15 +296,18 @@ def _normal_assignment(conn):
     """普通分配求解: 有锁定表时按锁定槽位严格求解, 无锁定时走原有求解器。
 
     锁定仅约束普通分配: 锁定槽位必须保留, 失效只报错不释放; 其余位置遵守
-    原有全部硬约束与优化次序。返回求解结果字典。
+    原有全部硬约束与优化次序。评审保障等级随求解传入: 仅在无法完整覆盖全部
+    论文时参与部分方案选取 (先总数, 再依次高/中等级数, 最后字典序),
+    完整可行时不影响既有容量比例与字典序优化。返回求解结果字典。
     """
     papers, reviewers = _load_domain(conn)
     recused = _recused_pairs(conn)
     groups = _institution_groups(conn)
+    levels = db.load_guarantee_levels(conn)
     lock_map = db.load_assignment_locks(conn)
     if lock_map:
-        return compute_locked_assignment(papers, reviewers, lock_map, recused, groups)
-    return compute_assignment(papers, reviewers, recused, groups)
+        return compute_locked_assignment(papers, reviewers, lock_map, recused, groups, levels=levels)
+    return compute_assignment(papers, reviewers, recused, groups, levels=levels)
 
 
 def _normalize_lock_table(raw: dict):
@@ -428,8 +433,10 @@ def delete_paper(paper_id: str, _: bool = Depends(require_organizer)):
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
         # 论文删除后不再参与分配, 其普通分配锁定随论文一并清除 (非"悄悄释放":
-        # 被锁对象已不存在; 评审人删除不级联, 锁定保留并在预演/发布中暴露)
+        # 被锁对象已不存在; 评审人删除不级联, 锁定保留并在预演/发布中暴露);
+        # 评审保障等级行同样随论文级联清除 (删除稿不再参与求解)
         conn.execute("DELETE FROM assignment_locks WHERE paper_id = ?", (paper_id,))
+        conn.execute("DELETE FROM paper_guarantee_levels WHERE paper_id = ?", (paper_id,))
         rev = db.bump_revision(conn)
     return {"ok": True, "paper_id": paper_id, "revision": rev}
 
@@ -557,8 +564,10 @@ def withdraw_paper(
         ).rowcount
         # 待处理异议原子过期; 已处理 (rejected/accepted) 与已过期异议保持终态
         expired_objections = db.expire_pending_objections_for_paper(conn, paper_id, now)
-        # 撤回稿不参与后续分配: 锁定行随撤回清除, 绝不以撤回稿的锁定阻塞其他论文
+        # 撤回稿不参与后续分配: 锁定行随撤回清除, 绝不以撤回稿的锁定阻塞其他论文;
+        # 评审保障等级行同样随撤回清除 (撤回稿的等级不再参与求解)
         conn.execute("DELETE FROM assignment_locks WHERE paper_id = ?", (paper_id,))
+        conn.execute("DELETE FROM paper_guarantee_levels WHERE paper_id = ?", (paper_id,))
         new_rev = db.bump_revision(conn)
         conn.execute(
             "INSERT INTO paper_withdrawals"
@@ -596,6 +605,121 @@ def get_paper_withdrawal(paper_id: str, _: bool = Depends(require_organizer)):
                 status_code=404, detail=f"论文 {paper_id} 不存在或尚未撤回"
             )
     return {"paper_id": paper_id, "state": "withdrawn", "withdrawal": _withdrawal_view(record)}
+
+
+# ------------------------------------------------ 论文评审保障等级 (会务方)
+
+# 评审保障等级: high=高, medium=中, normal=普通 (未设置即普通, 不落库)
+GUARANTEE_LEVELS = ("high", "medium", "normal")
+
+
+@app.post("/papers/{paper_id}/guarantee-level")
+def set_paper_guarantee_level(
+    paper_id: str,
+    body: PaperGuaranteeLevelIn,
+    _: bool = Depends(require_organizer),
+):
+    """会务方按论文设置评审保障等级 (high/medium/normal; 未设置即普通)。
+
+    凭现有密钥提交 论文编号 + 等级 + 当前资料修订号 base_revision:
+      - 路径与请求体论文编号不一致 -> 422; 等级非法 (非 high/medium/normal) -> 422;
+      - 请求在同一个写事务内先核对修订号: 过期/超前 -> 409, 拒绝且不留部分变更;
+      - 论文未知或已撤回 -> 404 (撤回稿不参与分配, 其等级不再参与求解), 不留部分变更;
+      - 相同等级重试幂等 (changed=false), 不推进修订号、不写记录;
+      - 有效变更推进资料修订号 +1: high/medium 落行, normal 清除该行 (恢复默认)。
+    等级仅在普通分配/补位无法完整覆盖各自目标论文时参与求解 (先使完整分配总数
+    最大, 再依次使高、中等级完整分配数最大, 最后沿用既有字典序); 完整可行时
+    不影响既有容量比例与字典序优化; 失效锁定不会被等级优先级释放。
+    """
+    if body.paper_id != paper_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"路径中的论文编号 ({paper_id}) 与请求体 ({body.paper_id}) 不一致",
+        )
+    level = body.level
+    if level not in GUARANTEE_LEVELS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"非法评审保障等级: {level!r}; 仅支持 "
+                "high (高) / medium (中) / normal (普通, 未设置时的默认等级)"
+            ),
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        rev = db.get_revision(conn)
+        if body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"资料已变更: 等级设置基于修订号 {body.base_revision},"
+                    f" 当前修订号为 {rev}, 请重新查看资料后再设置"
+                ),
+            )
+        paper = conn.execute(
+            "SELECT withdrawn FROM papers WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if paper is None:
+            raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+        if paper["withdrawn"]:
+            raise HTTPException(
+                status_code=404,
+                detail=f"论文 {paper_id} 已撤回, 不参与分配, 不可设置评审保障等级",
+            )
+        row = conn.execute(
+            "SELECT level FROM paper_guarantee_levels WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        current_level = row["level"] if row is not None else "normal"
+        if current_level == level:
+            # 相同等级重试: 幂等, 不写记录、不推进修订号
+            return {
+                "ok": True,
+                "paper_id": paper_id,
+                "level": level,
+                "changed": False,
+                "revision": rev,
+            }
+        if level == "normal":
+            # 恢复默认等级: 清除等级行 (未设置即普通)
+            conn.execute("DELETE FROM paper_guarantee_levels WHERE paper_id = ?", (paper_id,))
+        else:
+            conn.execute(
+                "INSERT INTO paper_guarantee_levels(paper_id, level, revision, updated_at)"
+                " VALUES (?,?,?,?)"
+                " ON CONFLICT(paper_id) DO UPDATE SET level = excluded.level,"
+                " revision = excluded.revision, updated_at = excluded.updated_at",
+                (paper_id, level, rev + 1, now),
+            )
+        new_rev = db.bump_revision(conn)
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "level": level,
+        "changed": True,
+        "revision": new_rev,
+    }
+
+
+@app.get("/papers/guarantee-levels")
+def list_paper_guarantee_levels(_: bool = Depends(require_organizer)):
+    """会务方查询各论文的评审保障等级与当前资料修订号。
+
+    列出全部现存 (未撤回) 论文的有效等级: 未设置的论文为 normal;
+    已删除/已撤回论文的等级已随论文清除, 不出现在列表中, 也不再参与求解。
+    """
+    with db.read_txn() as conn:
+        rev = db.get_revision(conn)
+        stored = db.load_guarantee_levels(conn)
+        paper_ids = [
+            r["paper_id"]
+            for r in conn.execute(
+                "SELECT paper_id FROM papers WHERE withdrawn = 0 ORDER BY paper_id"
+            ).fetchall()
+        ]
+    levels = {pid: stored.get(pid, "normal") for pid in paper_ids}
+    summary = {lv: sum(1 for v in levels.values() if v == lv) for lv in GUARANTEE_LEVELS}
+    return {"revision": rev, "levels": levels, "summary": summary}
 
 
 # ---------------------------------------------------------------- 评审人资料 (会务方)

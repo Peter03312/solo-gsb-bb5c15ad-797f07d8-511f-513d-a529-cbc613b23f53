@@ -43,6 +43,12 @@
   paper_withdrawals 表每篇撤回稿至多一行, 保存非空撤回原因、推进后的资料修订号、
   撤回时间及撤回瞬间的发布序号与槽位 (供追溯); 匹配当前修订号的同原因重试幂等
   返回原记录 (不推进修订号), 异原因/版本不符拒绝且无部分改动。
+- paper_guarantee_levels 表保存会务方按论文设置的评审保障等级 (high/medium;
+  未设置即普通 normal, 不落行, 设置为 normal 即清除该行): 仅在普通分配/补位
+  无法完整覆盖各自目标论文时参与求解——先使完整分配的论文总数最大, 再依次使
+  高、中等级完整分配数最大, 最后沿用既有字典序择优; 完整可行时等级不影响
+  既有容量比例与字典序优化。相同等级重试幂等 (不推进修订号), 有效变更推进
+  资料修订号 +1; 论文删除或撤回时其等级行随论文级联清除 (不再参与求解)。
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -247,6 +253,19 @@ CREATE TABLE IF NOT EXISTS paper_withdrawals (
     published_plan_json TEXT,                -- 撤回瞬间该稿的槽位 JSON: [评审人编号 ...]
     withdrawn_at        TEXT NOT NULL
 );
+-- 论文评审保障等级 (会务方按论文设置, 仅约束"无法完整覆盖"时的求解优先次序)。
+-- 每篇论文至多一行, 仅保存 high/medium; 未设置即普通 normal (不落行,
+-- 设置为 normal 即清除该行)。等级仅在普通分配/补位无法完整覆盖各自目标论文时
+-- 参与求解: 先使完整分配的论文总数最大, 再依次使高、中等级完整分配数最大,
+-- 最后沿用既有字典序择优; 完整可行时等级不影响既有容量比例与字典序优化。
+-- 相同等级重试幂等 (不推进修订号), 有效变更推进资料修订号 +1;
+-- 论文删除或撤回时其等级行随论文级联清除 (删除/撤回稿不再参与求解)。
+CREATE TABLE IF NOT EXISTS paper_guarantee_levels (
+    paper_id   TEXT PRIMARY KEY,
+    level      TEXT NOT NULL CHECK (level IN ('high', 'medium')),
+    revision   INTEGER NOT NULL,   -- 本次设置推进后的资料修订号
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -369,6 +388,20 @@ def load_assignment_locks(conn: sqlite3.Connection):
         r["paper_id"]: json.loads(r["reviewers_json"])
         for r in conn.execute(
             "SELECT paper_id, reviewers_json FROM assignment_locks ORDER BY paper_id"
+        ).fetchall()
+    }
+
+
+def load_guarantee_levels(conn: sqlite3.Connection):
+    """读取论文评审保障等级表, 返回 {paper_id: 'high'|'medium'} (按论文编号排序)。
+
+    未设置等级的论文视为普通 (normal), 不落行也不出现在结果中;
+    删除/撤回论文的等级行已随论文级联清除, 不会出现在结果中。
+    """
+    return {
+        r["paper_id"]: r["level"]
+        for r in conn.execute(
+            "SELECT paper_id, level FROM paper_guarantee_levels ORDER BY paper_id"
         ).fetchall()
     }
 
